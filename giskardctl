@@ -1,0 +1,193 @@
+#!/home/kkleidal/anaconda3/bin/python
+
+import sys
+import argparse
+import os
+import re
+import subprocess
+import json
+import getpass
+import time
+
+GISKARD_LAN_IP = "192.168.1.153"
+
+def ping(host, prefix=[]):
+    try:
+        p = subprocess.run(prefix + ["ping", "-c", "1", "-i", "0.5", host], capture_output=True, encoding="utf8", timeout=1)
+    except subprocess.TimeoutExpired:
+        return False
+    m = re.findall(r"^(\d+) packets? transmitted, (\d+) received", p.stdout, re.MULTILINE)[0]
+    sent, recv = tuple(int(x) for x in m)
+    return recv == sent
+
+def log_factory(verbose):
+    def log(*values, **kwargs):
+        if verbose:
+            if "file" not in kwargs:
+                kwargs["file"] = sys.stderr
+            if "flush" not in kwargs:
+                kwargs["flush"] = True
+            print(*values, **kwargs) 
+    return log
+
+def restart_hamachi(verbose=True):
+    log = log_factory(verbose)
+    log("Trying to restart hamachi (requires root)")
+    subprocess.run(["sudo", "hamachi", "logout"], check=True, timeout=5)
+    time.sleep(2)
+    subprocess.run(["sudo", "hamachi", "login"], check=True, timeout=5)
+    time.sleep(2)
+
+def boot_giskard(verbose=True):
+    log = log_factory(verbose)
+    while True:
+        current_state = state(verbose)
+        if current_state[Machine.GISKARD] == State.UP:
+            return
+        elif current_state[Machine.PI] != State.UP:
+            log("Can't boot giskard when gateway pi is down.")
+            sys.exit(1)
+        elif current_state[Machine.GISKARD] == State.DOWN:
+            # Wake up giskard using wake-on-LAN through raspberry pi
+            log("Waking up giskard...")
+            p = subprocess.run(["ssh", "dietpi@pi", "--", "./wake-giskard"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    check=True, timeout=5)
+            log("Woke giskard")
+
+            # Try to ping giskard's pre-boot busybox through the pi gateway
+            failures = 0
+            log("Waiting for giskard to boot.", end="")
+            while not ping(GISKARD_LAN_IP, prefix=["ssh", "dietpi@pi", "--"]):
+                log(".", end="")
+                failures += 1
+                if failures >= 15:
+                    log()
+                    log("Can't connect to giskard pre-boot interface from pi")
+                    sys.exit(1)
+                time.sleep(5)
+            log()
+        elif current_state[Machine.GISKARD] == State.PREBOOT:
+            # Unlock giskard's disk through the pi gateway
+            # Launches a new terminal where the user can enter the disk password
+            log("Unlocking giskard...")
+            cmd = [
+                "ssh", "-t", "dietpi@pi", "--",
+                "ssh", "-t", "-i", "giskard-unlock-key.pem", "root@%s" % GISKARD_LAN_IP, "--",
+                "unlock"]
+            log("Launching terminal for you to unlock Giskard's disk...")
+            subprocess.run(["gnome-terminal", "-e", "bash -c \"%s;\"" % (" ".join(cmd),)], check=True, timeout=5)
+
+            # Wait until giskard has boot and is reachable over hamachi VPC
+            log("Waiting for giskard to boot.", end="")
+            failures = 0
+            while not ping("giskard"):
+                log(".", end="", file=sys.stderr, flush=True)
+                failures += 1
+                time.sleep(5)
+            log()
+        else:
+            log("Unknown state")
+            sys.exit(1)
+
+def shutdown_giskard(verbose=True):
+    log = log_factory(verbose)
+    while True:
+        current_state = state(verbose)
+        if current_state[Machine.GISKARD] == State.DOWN:
+            return
+        elif current_state[Machine.GISKARD] == State.PREBOOT:
+            if current_state[Machine.PI] != State.UP:
+                log("Can't shutdown pre-boot giskard when gateway pi is down.")
+                sys.exit(1)
+            else:
+                cmd = [
+                    "ssh", "dietpi@pi", "--",
+                    "ssh", "-i", "giskard-unlock-key.pem", "root@%s" % GISKARD_LAN_IP, "--",
+                    "poweroff"]
+                subprocess.run(cmd, timeout=5)
+                time.sleep(10)
+        elif current_state[Machine.GISKARD] == State.UP:
+            cmd = [
+                "ssh", "root@giskard", "--",
+                "poweroff"]
+            subprocess.run(cmd, timeout=5)
+            time.sleep(10)
+        else:
+            log("Unknown state")
+            sys.exit(1)
+
+
+class State:
+    UNKNOWN = "unkown"
+    DOWN = "down"
+    PREBOOT = "preboot"
+    UP = "up"
+
+class Machine:
+    GISKARD = "giskard"
+    PI = "pi"
+
+def state(verbose=True):
+    pi_state = State.UNKNOWN
+    giskard_state = State.UNKNOWN
+
+    if not ping("pi"):
+        restart_hamachi(verbose)
+
+    if ping("pi"):
+        pi_state = State.UP
+    else:
+        pi_state = State.DOWN
+
+    if ping("giskard"):
+        giskard_state = State.UP
+    else:
+        if ping(GISKARD_LAN_IP, prefix=["ssh", "dietpi@pi", "--"]):
+            giskard_state = State.PREBOOT
+        else:
+            giskard_state = State.DOWN
+    return {
+            Machine.GISKARD: giskard_state,
+            Machine.PI: pi_state,
+    }
+
+class Output:
+    TEXT = "text"
+    JSON = "json"
+
+def cli_status(output=Output.TEXT, quiet=False, **kwargs):
+    out = state(verbose=(not quiet))
+    if output == Output.TEXT:
+        for key, value in sorted(out.items()):
+            print("%s: %s" % (key, value), flush=True)
+    elif output == Output.JSON:
+        print(json.dumps(out, indent=2, sort_keys=True))
+
+def cli_boot(quiet=False, **kwargs):
+    boot_giskard(verbose=(not quiet))
+
+def cli_shutdown(quiet=False, **kwargs):
+    shutdown_giskard(verbose=(not quiet))
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Power control for Giskard")
+    parser.add_argument("-q", "--quiet", action="store_true", help="suppress debug output")
+
+    commands = parser.add_subparsers(description="action to take")
+    
+    status_parser = commands.add_parser("status", help="get status of machines")
+    status_parser.set_defaults(handler=cli_status)
+    status_parser.add_argument("-o", "--output", choices=[Output.TEXT, Output.JSON],
+        default=Output.TEXT,
+        help="output format")
+
+    boot_parser = commands.add_parser("up", help="boot giskard")
+    boot_parser.set_defaults(handler=cli_boot)
+
+    shutdown_parser = commands.add_parser("down", help="shutdown giskard")
+    shutdown_parser.set_defaults(handler=cli_shutdown)
+    
+    args = parser.parse_args()
+
+    args.handler(**args.__dict__)

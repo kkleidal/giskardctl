@@ -33,9 +33,9 @@ def log_factory(verbose):
 def restart_hamachi(verbose=True):
     log = log_factory(verbose)
     log("Trying to restart hamachi (requires root)")
-    subprocess.run(["sudo", "hamachi", "logout"], check=True, timeout=5)
+    subprocess.run(["sudo", "hamachi", "logout"], check=True)
     time.sleep(2)
-    subprocess.run(["sudo", "hamachi", "login"], check=True, timeout=5)
+    subprocess.run(["sudo", "hamachi", "login"], check=True)
     time.sleep(2)
 
 def boot_giskard(verbose=True):
